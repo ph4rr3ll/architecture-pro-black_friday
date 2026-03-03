@@ -1,0 +1,703 @@
+# Схемы коллекций
+
+---
+
+### 1. Коллекция `products`
+
+#### Описание
+Справочник товаров. Запросы на чтение преобладают над записью. Основные паттерны: поиск по категориям, фильтр по цене, получение товара по ID.
+
+#### Стратегия шардирования
+Индекс на основе `_id` (хешированный) + тайловое шардирование по `category_id` как составной ключ. Одна категория (например, «Смартфоны») может содержать миллион товаров, а другая - сто. Это приведет к дисбалансу размера чанков. Если добавить в конец составного ключа уникальный `_id` (хешированный), данные внутри категории распределятся равномерно.
+
+#### Эффективность запросов
+* *Поиск товара по ID:* `{ _id: ObjectId(...) }`. Так как `_id` является частью шард-ключа, запрос пойдет точно на нужный шард (Targeted Query).
+* *Поиск по категории:* `{ category_id: 5, _id: { $gte: ... } }`. MongoDB сможет отправить запрос только на те шарды, где лежит эта категория, а не на все (Broadcast).
+
+**Схема:**
+
+```json
+{
+  "_id": ObjectId,
+  "product_id": UUID,  // или можно использовать _id как основной
+  "sku": String,       // артикул для поиска
+  "name": String,
+  "description": String,
+  "category": {
+    "id": NumberLong,  // category_id для шард-ключа
+    "name": String,
+    "path": String     // полный путь категории (electronics/smartphones)
+  },
+  "brand": String,
+  "price": {
+    "current": NumberDecimal,  // текущая цена
+    "old": NumberDecimal,      // старая цена (если есть скидка)
+    "currency": String         // валюта
+  },
+  "attributes": {
+    "color": String,
+    "size": String,
+    "weight": Number,
+    "dimensions": {
+      "length": Number,
+      "width": Number,
+      "height": String
+    }
+    // другие динамические атрибуты
+  },
+  "stock": [
+    {
+      "zone": String,
+      "quantity": Number
+    }
+  ],
+  "status": String,           // active, discontinued, coming_soon
+  "rating": {
+    "average": Number,
+    "count": Number
+  },
+  "images": [String],         // массив URL изображений
+  "created_at": ISODate,
+  "updated_at": ISODate,
+  
+  // служебные поля для шардинга
+  "__shard_key": {
+    "category_id": NumberLong,
+    "_id": ObjectId
+  }
+}
+
+// Индексы
+db.products.createIndex({ "category.id": 1, "_id": 1 })  // шард-ключ
+db.products.createIndex({ "sku": 1 }, { unique: true })
+db.products.createIndex({ "price.current": 1 })
+db.products.createIndex({ "brand": 1 })
+db.products.createIndex({ "rating.average": -1 })
+db.products.createIndex({ "attributes.color": 1, "attributes.size": 1 })  // для фильтрации
+```
+
+---
+
+### 2. Коллекция `orders`
+
+**Описание:** Заказы пользователей. Огромный поток записи (создание заказа + списание остатков) и чтения (история пользователя).
+
+#### Стратегия шардирования
+Составной шард-ключ: `{ user_id: 1, _id: 1 }` (хешированный или диапазонный). При шардировании по `user_id` все заказы одного пользователя гарантированно попадут на один шард. Это идеально для операций `find({user_id: X})`. Добавление `_id` гарантирует уникальность документа внутри шарда и позволяет эффективно искать конкретный заказ (Targeted Query), если известен `user_id`. Теоретически активный пользователь может создавать много заказов, но объем данных по одному пользователю растет последовательно, что не создает неконтролируемых пиков нагрузки на запись, как в случае с товарами. Поиск по статусу или геозоне без привязки к пользователю — это аналитические запросы (OLAP), которые обычно выгружают в отдельное хранилище.
+
+**Схема:**
+
+```json
+{
+  "_id": ObjectId,
+  "order_id": String,        // человекочитаемый номер заказа (например, ORD-2024-000001)
+  "user_id": NumberLong,     // ID клиента (часть шард-ключа)
+  "geozone": String,         // геозона доставки
+  "status": {
+    "code": String,          // new, paid, confirmed, shipped, delivered, cancelled
+    "history": [              // трекинг истории статусов
+      {
+        "status": String,
+        "changed_at": ISODate,
+        "changed_by": String  // system, user, manager
+      }
+    ]
+  },
+  "created_at": ISODate,
+  "updated_at": ISODate,
+  "completed_at": ISODate,   // дата завершения/доставки
+  
+  // Состав заказа (денормализован, чтобы не зависеть от changes в products)
+  "items": [
+    {
+      "product_id": ObjectId,
+      "sku": String,
+      "name": String,
+      "category_id": NumberLong,
+      "quantity": Number,
+      "price": {
+        "per_unit": NumberDecimal,
+        "total": NumberDecimal
+      },
+      "attributes": {
+        "color": String,
+        "size": String
+      }  // выбранные характеристики товара
+    }
+  ],
+  
+  // Финансовая информация
+  "totals": {
+    "subtotal": NumberDecimal,     // сумма товаров
+    "delivery": NumberDecimal,     // стоимость доставки
+    "discount": NumberDecimal,     // сумма скидок
+    "total": NumberDecimal         // итого
+  },
+  
+  // Платежная информация
+  "payment": {
+    "method": String,              // card, cash, apple_pay
+    "status": String,              // pending, paid, failed
+    "transaction_id": String,
+    "paid_at": ISODate
+  },
+  
+  // Доставка
+  "delivery": {
+    "address": {
+      "zone": String,              // геозона для списания остатков
+      "city": String,
+      "street": String,
+      "house": String,
+      "apartment": String,
+      "postal_code": String
+    },
+    "delivery_date": {
+      "from": ISODate,
+      "to": ISODate
+    },
+    "courier_info": String
+  },
+  
+  // Служебное поле для шард-ключа
+  "__shard_key": {
+    "user_id": NumberLong,
+    "_id": ObjectId
+  }
+}
+
+// Индексы
+db.orders.createIndex({ "user_id": 1, "_id": 1 })  // шард-ключ
+db.orders.createIndex({ "order_id": 1 }, { unique: true })
+db.orders.createIndex({ "user_id": 1, "created_at": -1 })  // для истории заказов (сортировка по дате)
+db.orders.createIndex({ "status.code": 1, "created_at": 1 })  // для поиска зависших заказов
+db.orders.createIndex({ "geozone": 1, "created_at": -1 })  // для отчетности по геозонам
+db.orders.createIndex({ "payment.status": 1, "created_at": 1 })  // для проверки неплатежей
+```
+
+---
+
+### 3. Коллекция `carts`
+
+**Описание:** Временные данные. Очень высокая частота записи (добавление в корзину) и частые чтения (показ корзины). Критично важно обеспечить низкую задержку.
+
+#### Стратегия шардирования
+1.  **Поле шард-ключа:** Создаем синтетическое поле `shard_key`.
+2.  **Логика заполнения:**
+    *   Если пользователь авторизован: `shard_key = user_id` (хешированный).
+    *   Если пользователь гость: `shарd_key = session_id` (хешированный).
+3.  **Шардирование:** `{ shard_key: "hashed" }`.
+
+Хеш от `session_id` так же равномерно распределит гостей по кластеру, как и хеш от `user_id` распределяет авторизованных. Никакого `null chunk`.
+**Targeted Queries:**
+    *   *Для гостя:* `find({shard_key: session_id, session_id: X, status: active})`.
+    *   *Для пользователя:* `find({shard_key: user_id, user_id: Y, status: active})`.
+    *   Запрос всегда идет на один шард.
+Чтобы перенести товары из гостевой в пользовательскую, нужно прочитать гостевую корзину по `shard_key = session_id` (это быстро), а затем обновить/вставить в корзину пользователя по `shard_key = user_id` (тоже быстро). Это операция на два шарда, но она редкая (только при логине).
+
+**Схема:**
+
+```json
+{
+  "_id": ObjectId,
+  "shard_key": String,          // синтетический ключ для шардирования
+  "cart_id": String,            // UUID для публичного использования
+  
+  // Идентификация (заполняется что-то одно)
+  "user_id": NumberLong,        // для авторизованных пользователей
+  "session_id": String,         // для гостей
+  
+  "type": String,               // "guest" или "user"
+  
+  // Состав корзины
+  "items": [
+    {
+      "item_id": ObjectId,      // уникальный ID позиции в корзине
+      "product_id": ObjectId,
+      "sku": String,            // денормализовано для быстрого отображения
+      "name": String,
+      "quantity": Number,
+      "price": NumberDecimal,   // цена на момент добавления
+      "attributes": {
+        "color": String,
+        "size": String
+      },
+      "added_at": ISODate,
+      "updated_at": ISODate,
+      "reserved_until": ISODate // до какого времени зарезервирован товар
+    }
+  ],
+  
+  // Сводка
+  "summary": {
+    "items_count": Number,      // общее количество позиций
+    "total_quantity": Number,   // общее количество товаров
+    "total_price": NumberDecimal
+  },
+  
+  // Промо и скидки
+  "promo": {
+    "code": String,
+    "discount": NumberDecimal,
+    "type": String              // fixed, percent
+  },
+  
+  // Статус
+  "status": String,             // "active", "ordered", "abandoned"
+  
+  // Временные метки
+  "created_at": ISODate,
+  "updated_at": ISODate,
+  "expires_at": ISODate,        // TTL индекс для автоматической очистки
+  
+  // Метаданные
+  "metadata": {
+    "user_agent": String,
+    "ip": String,
+    "referer": String
+  }
+}
+
+// Индексы
+db.carts.createIndex({ "shard_key": 1 })  // шард-ключ (хешированный)
+
+// Индексы для поиска корзин
+db.carts.createIndex({ "user_id": 1, "status": 1 })  // поиск активной корзины пользователя
+db.carts.createIndex({ "session_id": 1, "status": 1 })  // поиск активной корзины гостя
+db.carts.createIndex({ "cart_id": 1 })  // для прямого доступа
+
+// Индекс для TTL (автоматическое удаление старых корзин)
+db.carts.createIndex({ "expires_at": 1 }, { expireAfterSeconds: 0 })
+
+// Индекс для поиска "забытых" корзин
+db.carts.createIndex({ "status": 1, "updated_at": 1 })
+
+// Индекс для мержа корзин (поиск гостевой корзины при логине)
+db.carts.createIndex({ "session_id": 1, "status": 1, "created_at": -1 })
+```
+
+# Стратегия работы с "горячими" шардами
+
+## Метрики мониторинга для выявления "горячих" шардов
+
+### Системные метрики
+
+```yaml
+# Метрики для сбора в Prometheus/Grafana/NewRelic
+
+mongodb_shard_system:
+  - metric: "mongodb_shard_cpu_usage"
+    type: "gauge"
+    labels: ["shard_name", "host"]
+    description: "Загрузка CPU на шарде (%)"
+    alert_threshold: ">80% за 5 минут"
+
+  - metric: "mongodb_shard_memory_usage"
+    type: "gauge" 
+    labels: ["shard_name"]
+    description: "Использование RAM (%)"
+    alert_threshold: ">85%"
+
+  - metric: "mongodb_shard_disk_iops"
+    type: "gauge"
+    labels: ["shard_name", "device"]
+    description: "Количество операций ввода-вывода в секунду"
+    alert_threshold: ">80% от лимита"
+
+  - metric: "mongodb_shard_network_throughput"
+    type: "gauge"
+    labels: ["shard_name", "direction"]
+    description: "Сетевой трафик (bytes/sec)"
+    alert_threshold: "Аномалии по сравнению с базовой линией"
+```
+
+### Операционные метрики
+
+```yaml
+mongodb_shard_operations:
+  # Нагрузка на чтение/запись
+  - metric: "mongodb_shard_opcounters"
+    type: "counter"
+    labels: ["shard_name", "operation"]  # insert, query, update, delete, getmore, command
+    description: "Количество операций по типам"
+    alert_threshold: "Отклонение >3σ от среднего по другим шардам"
+
+  - metric: "mongodb_shard_queries_per_second"
+    type: "gauge"
+    labels: ["shard_name", "collection"]
+    description: "Количество запросов в секунду по коллекциям"
+    
+  - metric: "mongodb_shard_command_latency"
+    type: "histogram"
+    labels: ["shard_name", "command"]
+    description: "Задержки выполнения команд (ms)"
+    percentiles: [0.5, 0.95, 0.99]
+
+  # Распределение данных
+  - metric: "mongodb_shard_data_size"
+    type: "gauge"
+    labels: ["shard_name", "collection"]
+    description: "Размер данных на шарде (bytes)"
+    
+  - metric: "mongodb_shard_index_size"
+    type: "gauge"
+    labels: ["shard_name", "collection"]
+    description: "Размер индексов на шарде (bytes)"
+    
+  - metric: "mongodb_shard_chunks_count"
+    type: "gauge"
+    labels: ["shard_name", "collection"]
+    description: "Количество чанков на шарде"
+    
+  - metric: "mongodb_shard_chunks_by_range"
+    type: "gauge"
+    labels: ["shard_name", "collection", "min_key", "max_key"]
+    description: "Распределение чанков по ключам"
+    
+  - metric: "mongodb_shard_jumbo_chunks"
+    type: "gauge"
+    labels: ["shard_name", "collection"]
+    description: "Количество jumbo-чанков (не могут быть разделены)"
+```
+
+### Бизнес-метрики
+
+```yaml
+business_metrics:
+  # Аналитика по категориям
+  - metric: "mongodb_collection_category_distribution"
+    type: "gauge"
+    labels: ["collection", "category", "shard_name"]
+    description: "Распределение документов по категориям и шардам"
+    collection_interval: "1h"
+    
+  - metric: "mongodb_queries_by_category"
+    type: "counter"
+    labels: ["collection", "category", "shard_name", "query_type"]
+    description: "Количество запросов по категориям товаров"
+    
+  - metric: "mongodb_top_products_by_shard"
+    type: "gauge"
+    labels: ["shard_name", "product_id"]
+    description: "Топ-100 самых запрашиваемых товаров на каждом шарде"
+    
+  # Паттерны доступа
+  - metric: "mongodb_shard_hot_keys"
+    type: "gauge"
+    labels: ["shard_name", "collection", "key_value"]
+    description: "Частота обращений к конкретным значениям ключей"
+    
+  - metric: "mongodb_shard_key_skew"
+    type: "gauge"
+    labels: ["collection"]
+    description: "Коэффициент неравномерности распределения (0-1, где 1 - идеально)"
+    formula: "1 - (max_chunks - min_chunks) / total_chunks"
+```
+
+## Механизмы автоматического перераспределения данных
+
+### 1. Детектор горячих точек
+
+Выявление ключей и диапазонов, создающих непропорциональную нагрузку.
+
+**Алгоритм работы:**
+* сбор статистики запросов за окна 15 мин, 1 час, 24 часа;
+* кластеризация запросов по шард-ключам;
+* выявление ключей с частотой запросов > 3σ от среднего;
+* классификация дисбаланса: Read-heavy, Write-heavy, Data skew.
+
+### 2. Предиктивный анализатор
+
+Прогнозирование будущих горячих точек на основе исторических данных.
+
+**Механизмы прогнозирования:**
+* анализ сезонности (часы, дни, недели, месяцы);
+* отслеживание трендов популярности категорий;
+* мониторинг маркетинговых кампаний.
+
+**Результат:**
+* список категорий с прогнозируемым ростом нагрузки;
+* рекомендуемое количество чанков для пре-сплита.
+
+### 3. Сплиттер чанков
+
+Автоматическое разделение перегруженных чанков для миграции.
+
+**Условия сплита:**
+* размер чанка > 64 MB;
+* операций в секунду > 1000;
+* количество документов > 250 000.
+
+### 4. Адаптивный решардинг
+
+Изменение стратегии шардирования при кардинальном изменении паттернов доступа.
+
+**Условия запуска:**
+- Дисбаланс >50% в течение 7 дней
+- Невозможность сплита существующих чанков
+- Смена бизнес-модели
+
+**Процесс:**
+- анализ: сбор статистики за 30 дней, моделирование;
+- согласование: уведомление администраторам, оценка влияния;
+- исполнение: создание новой коллекции, фоновая миграция;
+- валидация: проверка целостности, возможность отката.
+
+
+# Стратегия распределения чтения между Primary и Secondary репликами
+
+## 1. Анализ требований к консистентности по коллекциям
+
+### 1.1 Коллекция `products`
+
+**Характеристики:**
+- **Частота обновлений:** Высокая (остатки товаров меняются постоянно)
+- **Тип обновлений:** Преимущественно `update` (списание остатков)
+- **Критичность консистентности:** Критичная для остатков, некритичная для описаний
+
+**Бизнес-требования:**
+- Нельзя продать товар, которого нет в наличии (строгая консистентность остатков)
+- Описание, цена, характеристики могут отображаться с небольшой задержкой
+
+### 1.2 Коллекция `orders`
+
+**Характеристики:**
+- **Частота обновлений:** Средняя (создание заказа, смена статусов)
+- **Тип обновлений:** Вставка новых документов, редкие обновления статуса
+- **Критичность консистентности:** Высокая для статуса заказа
+
+**Бизнес-требования:**
+- Пользователь должен видеть актуальный статус своего заказа
+- Служебные запросы на обработку заказов требуют точных данных
+
+### 1.3 Коллекция `carts`
+
+**Характеристики:**
+- **Частота обновлений:** Очень высокая (добавление/удаление товаров)
+- **Тип обновлений:** Множественные операции чтения-записи одной сессии
+- **Критичность консистентности:** Сессионная (чтение своих изменений)
+
+**Бизнес-требования:**
+- Пользователь должен видеть свои только что добавленные товары
+- Гостевые корзины менее критичны к задержкам
+
+## 2. Матрица маршрутизации запросов
+
+### 2.1 Коллекция `products`
+
+| Операция | Target | Обоснование | Допустимая задержка |
+|----------|--------|-------------|---------------------|
+| **Поиск товара по ID (страница товара)** | Secondary | Некритично, если описание устарело на несколько секунд | ≤ 5 секунд |
+| **Поиск по категориям (каталог)** | Secondary | Данные каталога меняются редко, кэшируются | ≤ 30 секунд |
+| **Фильтрация по цене** | Secondary | Аналитические запросы, не критичны к задержкам | ≤ 60 секунд |
+| **Проверка остатка перед добавлением в корзину** | **Primary** | Критично: нельзя зарезервировать отсутствующий товар | 0 (linearizable) |
+| **Списание остатков при оформлении заказа** | **Primary** | Транзакционная операция, требует актуальных данных | 0 |
+| **Админка: обновление товара** | **Primary** | Запись должна читаться после подтверждения | 0 |
+
+### 2.2 Коллекция `orders`
+
+| Операция | Target | Обоснование | Допустимая задержка |
+|----------|--------|-------------|---------------------|
+| **Просмотр истории заказов пользователем** | Secondary | Пользователь ожидает видеть последние заказы, но допускает задержку | ≤ 2 секунды |
+| **Проверка статуса конкретного заказа** | **Primary** | Пользователь проверяет статус после оплаты - должен видеть сразу | ≤ 1 секунда |
+| **Создание нового заказа** | **Primary** | Запись должна быть подтверждена | 0 |
+| **Обновление статуса заказа (системное)** | **Primary** | Критично для логистики | 0 |
+| **Отчеты по заказам (бизнес-аналитика)** | Secondary | Не критично к задержкам, можно читать устаревшие данные | ≤ 1 час |
+| **Поиск заказов в работе (для курьеров)** | Secondary | Допустима небольшая задержка | ≤ 5 секунд |
+
+### 2.3 Коллекция `carts`
+
+| Операция | Target | Обоснование | Допустимая задержка |
+|----------|--------|-------------|---------------------|
+| **Получение текущей корзины пользователя** | **Primary (или read-after-write)** | Пользователь должен видеть только что добавленные товары | read-your-writes |
+| **Добавление товара в корзину** | **Primary** | Запись должна быть подтверждена | 0 |
+| **Удаление товара из корзины** | **Primary** | Запись должна быть подтверждена | 0 |
+| **Слияние корзин при логине** | **Primary** | Транзакционная операция | 0 |
+| **Получение гостевой корзины** | Secondary | Гость может допустить задержку | ≤ 3 секунды |
+| **Очистка abandon-корзин (TTL)** | **Primary** | Удаление данных | 0 |
+| **Админка: просмотр всех корзин** | Secondary | Аналитика, не критично | ≤ 5 минут |
+
+# Миграция с MongoDB на Cassandra: Архитектурное решение для "Чёрной пятницы"
+
+## Анализ критически важных данных
+
+### 1.1 Классификация данных по требованиям
+
+| Сущность | Текущее хранилище | Критичность к целостности | Требования к скорости | Частота записи | Частота чтения | Стоит ли применять Cassandra |
+|----------|-------------------|---------------------------|----------------------|-----------------|-----------------|----------------------|
+| **Заказы (orders)** | MongoDB | Очень высокая | Высокая (пиковые нагрузки) | Средняя (до 5000/сек) | Высокая (статусы) | Да |
+| **Корзины (carts)** | MongoDB | Средняя | Очень высокая | Очень высокая (до 50k/сек) | Очень высокая | Да |
+| **Товары (products)** | MongoDB | Высокая (остатки) | Высокая | Высокая (списания) | Очень высокая | Ограниченно |
+| **История заказов** | MongoDB | Низкая | Средняя | Низкая | Средняя | Да |
+| **Пользовательские сессии** | Не хранится | Низкая | Очень высокая | Очень высокая | Высокая | Да |
+| **Каталог товаров** | MongoDB | Низкая | Средняя | Низкая | Очень высокая | Ограниченно |
+| **Остатки по геозонам** | MongoDB | Очень высокая | Очень высокая | Очень высокая | Высокая | Нет |
+
+### 1.2 Обоснование выбора сущностей для миграции в Cassandra
+
+#### Сущности, мигрируемые в Cassandra
+
+**1. Заказы (orders)**
+- **Допустимость использования Cassandra:** линейная масштабируемость при пиковых нагрузках, отказоустойчивость без единой точки отказа.
+- **Паттерн доступа:** запись при создании, чтение по user_id + timestamp.
+- **Требования:** ACID не критичен, CAP -> AP (доступность важнее консистентности).
+
+**2. Корзины (carts)**
+- **Допустимость использования Cassandra:** огромная скорость записи (до 100k ops/sec), естественная партицирование по user_id/session_id.
+- **Паттерн доступа:** множественные read/write одной сессии.
+- **Требования:** высокая доступность, eventual consistency допустима.
+
+**3. История заказов**
+- **Допустимость использования Cassandra:** time-series данные, идеальны для Cassandra.
+- **Паттерн доступа:** запись 1 раз, чтение по user_id за период.
+- **Требования:** низкая задержка при чтении истории.
+
+**4. Пользовательские сессии**
+- **Допустимость использования Cassandra:** leaderless репликация обеспечивает доступность при отказе узлов.
+- **Паттерн доступа:** ключ-значение с TTL.
+- **Требования:** высокая скорость чтения/записи, данные временные.
+
+#### Сущности, для которых допускается ограниченное использование Cassandra
+
+**Товары (products) и Каталог**
+- **Проблема:** Cassandra не оптимизирована для вторичных индексов и поиска по категориям.
+- **Решение:** 
+  - основной каталог оставить в MongoDB (богатые запросы);
+  - в Cassandra использовать денормализацию под конкретные паттерны запросов.
+
+#### Данные, требующие строгой консистентности
+
+**Остатки по геозонам**
+- **Проблема:** требуют строгой консистентности (нельзя oversell).
+- **Решение:** оставить в MongoDB.
+
+---
+
+## Проектирование концептуальной схемы данных в Cassandra
+
+### Orders
+
+```sql
+-- Таблица для активных заказов (текущие/недавние)
+CREATE TABLE orders_by_user (
+    user_id UUID,                    -- partition key 1: равномерное распределение
+    order_id UUID,                    -- cluster key 1: уникальность
+    order_date timestamp,              -- cluster key 2: сортировка по дате
+    status text,
+    total_amount decimal,
+    items list<frozen<order_item>>,
+    delivery_address text,
+    payment_status text,
+    geozone text,
+    created_at timestamp,
+    updated_at timestamp,
+    PRIMARY KEY ((user_id), order_date, order_id)
+) WITH CLUSTERING ORDER BY (order_date DESC, order_id ASC)
+  AND default_time_to_live = 2592000;  -- 30 дней для активных
+
+-- Таблица для истории заказов (архив)
+CREATE TABLE orders_history (
+    user_id UUID,
+    year int,                          -- композитный partition key для распределения
+    month int,
+    order_id UUID,
+    order_date timestamp,
+    status text,
+    total_amount decimal,
+    items list<frozen<order_item>>,
+    PRIMARY KEY ((user_id, year, month), order_date, order_id)
+) WITH CLUSTERING ORDER BY (order_date DESC, order_id ASC)
+  AND compaction = { 'class': 'TimeWindowCompactionStrategy' };
+
+-- Таблица для отслеживания статуса заказов (для служб доставки)
+CREATE TABLE orders_by_status (
+    status text,
+    time_bucket text,                  -- bucket по часам: '2024-11-29-10'
+    order_id UUID,
+    user_id UUID,
+    order_date timestamp,
+    PRIMARY KEY ((status, time_bucket), order_date, order_id)
+) WITH CLUSTERING ORDER BY (order_date DESC, order_id ASC);
+```
+
+Обоснование ключей:
+* Partition key user_id: равномерное распределение по кластеру, все заказы пользователя в одной партиции;
+* Cluster key order_date: сортировка от новых к старым, эффективные range-запросы;
+* TTL 30 дней: автоматическая архивация старых заказов.
+
+### Carts
+
+```sql
+-- Активные корзины пользователей
+CREATE TABLE active_carts (
+    cart_owner text,                    -- "user:123" или "session:abc123"
+    cart_id UUID,
+    user_id UUID,                        -- может быть null для гостей
+    session_id text,                      -- для гостей
+    items map<UUID, frozen<cart_item>>,  -- product_id -> item
+    items_count int,
+    total_price decimal,
+    status text,                          -- active, abandoned
+    updated_at timestamp,
+    expires_at timestamp,
+    PRIMARY KEY ((cart_owner), updated_at, cart_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, cart_id ASC)
+  AND default_time_to_live = 604800;      -- 7 дней
+
+-- Временные корзины (для гостей)
+CREATE TABLE guest_carts (
+    session_id text,
+    cart_id UUID,
+    items map<UUID, frozen<cart_item>>,
+    created_at timestamp,
+    updated_at timestamp,
+    PRIMARY KEY ((session_id), updated_at, cart_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, cart_id ASC)
+  AND default_time_to_live = 86400;        -- 1 день
+
+-- Материализованное представление для поиска по user_id (если нужно)
+-- Но лучше дублировать данные: в active_carts и user_carts
+CREATE TABLE user_carts (
+    user_id UUID,
+    cart_id UUID,
+    items map<UUID, frozen<cart_item>>,
+    updated_at timestamp,
+    PRIMARY KEY ((user_id), updated_at, cart_id)
+) WITH CLUSTERING ORDER BY (updated_at DESC, cart_id ASC);
+```
+
+Обоснование ключей:
+* Составной partition key: распределение по типу владельца (user/session);
+* Map для items: эффективное обновление конкретных товаров;
+* TTL: автоматическая очистка брошенных корзин.
+
+### Меры предотвращения горячих партиций
+
+1) Проблема: один пользователь может иметь 1000+ заказов.
+Решение: 
+- ограничение размера партиции (max 10MB);
+- автоматическая архивация старых заказов;
+- bucketing по времени для истории.
+  
+2) Проблема: популярные товары создают горячие партиции.
+Решение:
+- дополнительное шардирование по product_id + geozone;
+- использование отдельной системы для высоконагруженных товаров.
+  
+3) Проблема: тысячи одновременных обновлений одной корзины.
+Решение:
+- оптимистичные обновления с легковесными транзакциями;
+- rate limiting на уровне приложения.
+
+---
+
+## Применение стратегий целестности данных по сущностям
+
+### 3.2 Применение стратегий по сущностям
+
+| Сущность | Hinted Handoff | Read Repair | Anti-Entropy | Обоснование |
+|----------|----------------|-------------|--------------|-------------|
+| **Заказы (orders)** | Включен | Высокий % | Ежедневно | Целостность заказов критична для бизнеса, но допустима eventual consistency. Высокий % read repair обеспечивает быстрое выявление расхождений. Анти-энтропия ночью для полной синхронизации. |
+| **Корзины (carts)** | Включен | Низкий % | Ежечасно | Скорость важнее консистентности — потеря корзины не катастрофа. Hinted handoff защищает от потери данных при отказе узлов. Частая анти-энтропия из-за высокой изменчивости данных. |
+| **Сессии (sessions)** | Включен | Отключен | Ежедневно | Данные временные с TTL, строгая консистентность не требуется. Hinted handoff достаточен для сохранности. Read repair только увеличит latency. |
+| **История заказов** | Включен | Средний % | Еженедельно | Данные иммутабельны (не изменяются после записи), расхождения маловероятны. Анти-энтропия реже из-за статичности данных. |
